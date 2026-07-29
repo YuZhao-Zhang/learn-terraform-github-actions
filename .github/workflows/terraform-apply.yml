@@ -5,24 +5,67 @@ on:
     branches:
       - main
 
+concurrency:
+  group: terraform-apply-learn-terraform-github-actions
+  cancel-in-progress: false
+
 env:
   TF_CLOUD_ORGANIZATION: "yuzhao-terraform"
   TF_API_TOKEN: "${{ secrets.TF_API_TOKEN }}"
   TF_WORKSPACE: "learn-terraform-github-actions"
   CONFIG_DIRECTORY: "./"
 
+  TFCTL_VERSION: "0.3.0"
+  TFCTL_HOSTNAME: "app.terraform.io"
+  TFCTL_ORGANIZATION: "yuzhao-terraform"
+  TFCTL_TOKEN: "${{ secrets.TF_API_TOKEN }}"
+  TFCTL_TELEMETRY: "disabled"
 
 jobs:
   terraform:
     if: github.repository != 'hashicorp-education/learn-terraform-github-actions'
     name: "Terraform Apply"
     runs-on: ubuntu-latest
-    permissions: # granular permissions
-      # so GitHub can check out this repo using the default github.token
+    timeout-minutes: 45
+
+    permissions:
       contents: read
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+
+      - name: Install tfctl
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$(uname -m)" in
+            x86_64) tfctl_arch="amd64" ;;
+            aarch64|arm64) tfctl_arch="arm64" ;;
+            *)
+              echo "Unsupported runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+
+          tfctl_archive="tfctl_${TFCTL_VERSION}_linux_${tfctl_arch}.zip"
+          tfctl_release_url="https://releases.hashicorp.com/tfctl/${TFCTL_VERSION}"
+
+          curl --fail --silent --show-error --location \
+            --output "${tfctl_archive}" \
+            "${tfctl_release_url}/${tfctl_archive}"
+
+          curl --fail --silent --show-error --location \
+            --output tfctl_SHA256SUMS \
+            "${tfctl_release_url}/tfctl_${TFCTL_VERSION}_SHA256SUMS"
+
+          grep " ${tfctl_archive}$" tfctl_SHA256SUMS | sha256sum --check -
+
+          unzip -q "${tfctl_archive}"
+          sudo install -m 0755 tfctl /usr/local/bin/tfctl
+
+          tfctl --version
 
       - name: Upload Configuration
         uses: hashicorp/tfc-workflows-github/actions/upload-configuration@v1.0.0
@@ -38,6 +81,19 @@ jobs:
           workspace: ${{ env.TF_WORKSPACE }}
           configuration_version: ${{ steps.apply-upload.outputs.configuration_version_id }}
 
+      - name: Verify Apply Run with tfctl
+        shell: bash
+        env:
+          TFCTL_RUN_ID: ${{ steps.apply-run.outputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          echo "HCP Terraform run: ${TFCTL_RUN_ID}"
+
+          tfctl api "/runs/${TFCTL_RUN_ID}" \
+            --jq='.data.attributes | {status, "is-confirmable": .actions."is-confirmable"}' \
+            --no-color
+
       - name: Apply
         uses: hashicorp/tfc-workflows-github/actions/apply-run@v1.0.0
         if: fromJSON(steps.apply-run.outputs.payload).data.attributes.actions.IsConfirmable
@@ -45,3 +101,15 @@ jobs:
         with:
           run: ${{ steps.apply-run.outputs.run_id }}
           comment: "Apply Run from GitHub Actions CI ${{ github.sha }}"
+
+      - name: Report Final Run Status with tfctl
+        if: always() && steps.apply-run.outputs.run_id != ''
+        shell: bash
+        env:
+          TFCTL_RUN_ID: ${{ steps.apply-run.outputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          tfctl api "/runs/${TFCTL_RUN_ID}" \
+            --jq='.data.attributes | {status, message}' \
+            --no-color
