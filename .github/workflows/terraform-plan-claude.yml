@@ -1,0 +1,261 @@
+name: "Terraform Plan Claude Review"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: terraform-plan-claude-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_CLOUD_ORGANIZATION: "yuzhao-terraform"
+  TF_API_TOKEN: "${{ secrets.TF_API_TOKEN }}"
+  TF_WORKSPACE: "learn-terraform-github-actions"
+  CONFIG_DIRECTORY: "./"
+
+  TFCTL_VERSION: "0.3.0"
+  TFCTL_HOSTNAME: "app.terraform.io"
+  TFCTL_ORGANIZATION: "yuzhao-terraform"
+  TFCTL_TOKEN: "${{ secrets.TF_API_TOKEN }}"
+  TFCTL_TELEMETRY: "disabled"
+
+jobs:
+  terraform-plan-claude:
+    if: github.repository != 'hashicorp-education/learn-terraform-github-actions'
+    name: "Terraform Plan Claude Review"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install tfctl
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$(uname -m)" in
+            x86_64) tfctl_arch="amd64" ;;
+            aarch64|arm64) tfctl_arch="arm64" ;;
+            *)
+              echo "Unsupported runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+
+          tfctl_archive="tfctl_${TFCTL_VERSION}_linux_${tfctl_arch}.zip"
+          tfctl_release_url="https://releases.hashicorp.com/tfctl/${TFCTL_VERSION}"
+
+          curl --fail --silent --show-error --location \
+            --output "${tfctl_archive}" \
+            "${tfctl_release_url}/${tfctl_archive}"
+
+          curl --fail --silent --show-error --location \
+            --output tfctl_SHA256SUMS \
+            "${tfctl_release_url}/tfctl_${TFCTL_VERSION}_SHA256SUMS"
+
+          grep " ${tfctl_archive}$" tfctl_SHA256SUMS | sha256sum --check -
+
+          unzip -q "${tfctl_archive}"
+          sudo install -m 0755 tfctl /usr/local/bin/tfctl
+
+          rm -f "${tfctl_archive}" tfctl_SHA256SUMS tfctl
+
+          tfctl --version
+
+      - name: Install tfctl skill for Claude
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tfctl harness install claude --global
+
+          printf '%s\n' 'Installed tfctl skill:'
+          ls -l "$HOME/.claude/skills/tfctl/SKILL.md"
+
+          printf '%s\n' 'Skill preview:'
+          sed -n '1,80p' "$HOME/.claude/skills/tfctl/SKILL.md"
+
+      - name: Upload Configuration
+        uses: hashicorp/tfc-workflows-github/actions/upload-configuration@v1.0.0
+        id: plan-upload
+        with:
+          workspace: ${{ env.TF_WORKSPACE }}
+          directory: ${{ env.CONFIG_DIRECTORY }}
+          speculative: true
+
+      - name: Create Plan Run
+        uses: hashicorp/tfc-workflows-github/actions/create-run@v1.0.0
+        id: plan-run
+        with:
+          workspace: ${{ env.TF_WORKSPACE }}
+          configuration_version: ${{ steps.plan-upload.outputs.configuration_version_id }}
+          plan_only: true
+
+      - name: Get Plan Output
+        uses: hashicorp/tfc-workflows-github/actions/plan-output@v1.0.0
+        id: plan-output
+        with:
+          plan: ${{ fromJSON(steps.plan-run.outputs.payload).data.relationships.plan.data.id }}
+
+      - name: Collect Plan Artifacts with tfctl
+        shell: bash
+        env:
+          RUN_ID: ${{ steps.plan-run.outputs.run_id }}
+          RUN_LINK: ${{ steps.plan-run.outputs.run_link }}
+          PLAN_ID: ${{ fromJSON(steps.plan-run.outputs.payload).data.relationships.plan.data.id }}
+          ADD_COUNT: ${{ steps.plan-output.outputs.add }}
+          CHANGE_COUNT: ${{ steps.plan-output.outputs.change }}
+          DESTROY_COUNT: ${{ steps.plan-output.outputs.destroy }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p plan-artifacts
+
+          cat > plan-artifacts/summary.md <<EOF
+          # Terraform Plan Summary
+
+          - Organization: ${TFCTL_ORGANIZATION}
+          - Workspace: ${TF_WORKSPACE}
+          - Run ID: ${RUN_ID}
+          - Plan ID: ${PLAN_ID}
+          - Run link: ${RUN_LINK}
+          - Resource changes: ${ADD_COUNT} to add, ${CHANGE_COUNT} to change, ${DESTROY_COUNT} to destroy
+          EOF
+
+          tfctl run status "${RUN_ID}" \
+            --markdown \
+            --no-color \
+            > plan-artifacts/run-status.md
+
+          if tfctl api "/plans/${PLAN_ID}/json-output" \
+            --no-color \
+            > plan-artifacts/plan.json \
+            2> plan-artifacts/plan-json-error.txt; then
+
+            jq '{
+              format_version,
+              terraform_version,
+              resource_changes: (.resource_changes // []),
+              output_changes: (.output_changes // {})
+            }' \
+              plan-artifacts/plan.json \
+              > plan-artifacts/plan-changes.json
+
+            rm -f \
+              plan-artifacts/plan.json \
+              plan-artifacts/plan-json-error.txt
+          else
+            printf '%s\n' \
+              'Structured plan JSON unavailable; review will use run-status.md and summary.md.' >&2
+
+            cat plan-artifacts/plan-json-error.txt || true
+            rm -f plan-artifacts/plan.json
+          fi
+
+          printf '%s\n' 'Plan artifacts:'
+          ls -la plan-artifacts
+
+      - name: Review Plan with Claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          track_progress: true
+
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Use the installed tfctl skill when reviewing this HCP Terraform plan.
+
+            You are reviewing a speculative Terraform plan for this pull request.
+
+            The PR branch is already checked out.
+
+            Read these files:
+
+            - plan-artifacts/summary.md
+            - plan-artifacts/run-status.md
+            - plan-artifacts/plan-changes.json, if it exists
+
+            Also inspect the changed Terraform .tf files in this pull request.
+
+            Review the actual Terraform plan, not just the source code.
+
+            Prepare a concise review titled exactly:
+
+            ## Claude Terraform Plan Review
+
+            Cover:
+
+            1. Plan Summary
+
+               Explain what the HCP Terraform plan actually changes.
+
+            2. Risky or Destructive Changes
+
+               Call out resource deletions, replacements, downtime risk,
+               data-loss risk, or other potentially dangerous changes first.
+
+            3. Code-to-Plan Alignment
+
+               Determine whether the plan matches the apparent intent of
+               the Terraform code changes in this pull request.
+
+            4. Security and Terraform Best Practices
+
+               Look for:
+               - hardcoded secrets
+               - overly permissive access
+               - insecure configuration
+               - missing important tags
+               - drift-prone configuration
+               - other Terraform best-practice concerns
+
+            5. HCP Terraform Run Health
+
+               Report warnings, policy failures, diagnostics, or errors
+               from run-status.md.
+
+            Reference specific Terraform resource addresses when possible.
+
+            If the plan is a no-op or clearly low risk, say so directly
+            and keep the review brief.
+
+            IMPORTANT:
+
+            You MUST post the completed review as a top-level comment
+            on PR #${{ github.event.pull_request.number }}.
+
+            Use gh pr comment for the final review.
+
+            Do not only return the review in your response.
+
+            Do not finish until the PR comment has been successfully posted.
+
+            Use this pattern:
+
+            gh pr comment ${{ github.event.pull_request.number }} \
+              --repo ${{ github.repository }} \
+              --body "<your completed review>"
+
+            Do not modify repository files.
+
+            Do not execute terraform apply.
+
+            Do not execute any mutating tfctl commands.
+
+          claude_args: |
+            --max-turns 15
+            --allowedTools "Read,Glob,Grep,Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh pr diff:*)"
