@@ -1,0 +1,171 @@
+name: "Terraform Plan Claude Review"
+
+on:
+  pull_request:
+
+concurrency:
+  group: terraform-plan-claude-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_CLOUD_ORGANIZATION: "yuzhao-terraform"
+  TF_API_TOKEN: "${{ secrets.TF_API_TOKEN }}"
+  TF_WORKSPACE: "learn-terraform-github-actions"
+  CONFIG_DIRECTORY: "./"
+
+  TFCTL_VERSION: "0.3.0"
+  TFCTL_HOSTNAME: "app.terraform.io"
+  TFCTL_ORGANIZATION: "yuzhao-terraform"
+  TFCTL_TOKEN: "${{ secrets.TF_API_TOKEN }}"
+  TFCTL_TELEMETRY: "disabled"
+
+jobs:
+  terraform-plan-claude:
+    if: github.repository != 'hashicorp-education/learn-terraform-github-actions'
+    name: "Terraform Plan Claude Review"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tfctl
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$(uname -m)" in
+            x86_64) tfctl_arch="amd64" ;;
+            aarch64|arm64) tfctl_arch="arm64" ;;
+            *)
+              echo "Unsupported runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+
+          tfctl_archive="tfctl_${TFCTL_VERSION}_linux_${tfctl_arch}.zip"
+          tfctl_release_url="https://releases.hashicorp.com/tfctl/${TFCTL_VERSION}"
+
+          curl --fail --silent --show-error --location \
+            --output "${tfctl_archive}" \
+            "${tfctl_release_url}/${tfctl_archive}"
+
+          curl --fail --silent --show-error --location \
+            --output tfctl_SHA256SUMS \
+            "${tfctl_release_url}/tfctl_${TFCTL_VERSION}_SHA256SUMS"
+
+          grep " ${tfctl_archive}$" tfctl_SHA256SUMS | sha256sum --check -
+
+          unzip -q "${tfctl_archive}"
+          sudo install -m 0755 tfctl /usr/local/bin/tfctl
+
+          rm -f "${tfctl_archive}" tfctl_SHA256SUMS tfctl
+
+          tfctl --version
+
+      - name: Upload Configuration
+        uses: hashicorp/tfc-workflows-github/actions/upload-configuration@v1.0.0
+        id: plan-upload
+        with:
+          workspace: ${{ env.TF_WORKSPACE }}
+          directory: ${{ env.CONFIG_DIRECTORY }}
+          speculative: true
+
+      - name: Create Plan Run
+        uses: hashicorp/tfc-workflows-github/actions/create-run@v1.0.0
+        id: plan-run
+        with:
+          workspace: ${{ env.TF_WORKSPACE }}
+          configuration_version: ${{ steps.plan-upload.outputs.configuration_version_id }}
+          plan_only: true
+
+      - name: Get Plan Output
+        uses: hashicorp/tfc-workflows-github/actions/plan-output@v1.0.0
+        id: plan-output
+        with:
+          plan: ${{ fromJSON(steps.plan-run.outputs.payload).data.relationships.plan.data.id }}
+
+      - name: Collect Plan Artifacts with tfctl
+        shell: bash
+        env:
+          RUN_ID: ${{ steps.plan-run.outputs.run_id }}
+          RUN_LINK: ${{ steps.plan-run.outputs.run_link }}
+          PLAN_ID: ${{ fromJSON(steps.plan-run.outputs.payload).data.relationships.plan.data.id }}
+          ADD_COUNT: ${{ steps.plan-output.outputs.add }}
+          CHANGE_COUNT: ${{ steps.plan-output.outputs.change }}
+          DESTROY_COUNT: ${{ steps.plan-output.outputs.destroy }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p plan-artifacts
+
+          cat > plan-artifacts/summary.md <<EOF
+          # Terraform Plan Summary
+
+          - Organization: ${TFCTL_ORGANIZATION}
+          - Workspace: ${TF_WORKSPACE}
+          - Run ID: ${RUN_ID}
+          - Plan ID: ${PLAN_ID}
+          - Run link: ${RUN_LINK}
+          - Resource changes: ${ADD_COUNT} to add, ${CHANGE_COUNT} to change, ${DESTROY_COUNT} to destroy
+          EOF
+
+          # Run status, including any Terraform diagnostics or policy failures.
+          tfctl run status "${RUN_ID}" --markdown --no-color \
+            > plan-artifacts/run-status.md
+
+          # Structured plan output. Large plans are reduced to the change set so
+          # the review prompt stays within a reasonable size.
+          if tfctl api "/plans/${PLAN_ID}/json-output" --no-color \
+            > plan-artifacts/plan.json 2> plan-artifacts/plan-json-error.txt; then
+            jq '{
+              format_version,
+              terraform_version,
+              resource_changes: (.resource_changes // []),
+              output_changes: (.output_changes // {})
+            }' plan-artifacts/plan.json > plan-artifacts/plan-changes.json
+            rm -f plan-artifacts/plan.json plan-artifacts/plan-json-error.txt
+          else
+            echo "Structured plan JSON unavailable; review will use the run status only." >&2
+            rm -f plan-artifacts/plan.json
+          fi
+
+          ls -la plan-artifacts
+
+      - name: Review Plan with Claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are reviewing a speculative Terraform plan for this pull request.
+
+            The plan artifacts are in the `plan-artifacts/` directory:
+            - `summary.md` — workspace, run link, and change counts
+            - `run-status.md` — HCP Terraform run status and any diagnostics
+            - `plan-changes.json` — structured resource and output changes (may be absent)
+
+            Read those files and the changed `.tf` files in this repository, then
+            post a single PR comment titled "Claude Terraform Plan Review" that covers:
+
+            1. A plain-language summary of what this plan actually changes.
+            2. Destructive or risky changes — resource replacements, deletions, or
+               anything that would cause downtime or data loss. Call these out first.
+            3. Whether the plan matches the intent of the code changes in the diff,
+               and flag any change that looks unintended.
+            4. Security and best-practice concerns: hardcoded secrets, permissive
+               access rules, missing tags, drift-prone configuration.
+            5. Anything in `run-status.md` that failed or produced warnings.
+
+            Be concrete and reference specific resource addresses. If the plan is a
+            no-op or purely additive and low risk, say so briefly instead of padding
+            the review. Do not modify any files.
+          claude_args: |
+            --max-turns 15
+            --allowedTools Read,Glob,Grep
