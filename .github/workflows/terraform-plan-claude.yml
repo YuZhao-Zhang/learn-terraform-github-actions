@@ -31,7 +31,6 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-      actions: read
       id-token: write
 
     steps:
@@ -49,7 +48,7 @@ jobs:
             x86_64) tfctl_arch="amd64" ;;
             aarch64|arm64) tfctl_arch="arm64" ;;
             *)
-              echo "Unsupported runner architecture: $(uname -m)" >&2
+              printf '%s\n' "Unsupported runner architecture: $(uname -m)" >&2
               exit 1
               ;;
           esac
@@ -83,9 +82,6 @@ jobs:
 
           printf '%s\n' 'Installed tfctl skill:'
           ls -l "$HOME/.claude/skills/tfctl/SKILL.md"
-
-          printf '%s\n' 'Skill preview:'
-          sed -n '1,80p' "$HOME/.claude/skills/tfctl/SKILL.md"
 
       - name: Upload Configuration
         uses: hashicorp/tfc-workflows-github/actions/upload-configuration@v1.0.0
@@ -158,7 +154,7 @@ jobs:
               plan-artifacts/plan-json-error.txt
           else
             printf '%s\n' \
-              'Structured plan JSON unavailable; review will use run-status.md and summary.md.' >&2
+              'Structured plan JSON unavailable; review will use summary and run status only.' >&2
 
             cat plan-artifacts/plan-json-error.txt || true
             rm -f plan-artifacts/plan.json
@@ -171,91 +167,65 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          track_progress: true
 
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
 
-            Use the installed tfctl skill when reviewing this HCP Terraform plan.
+            Review this Terraform plan.
 
-            You are reviewing a speculative Terraform plan for this pull request.
-
-            The PR branch is already checked out.
-
-            Read these files:
+            Read only these files:
 
             - plan-artifacts/summary.md
             - plan-artifacts/run-status.md
-            - plan-artifacts/plan-changes.json, if it exists
+            - plan-artifacts/plan-changes.json if it exists
+            - main.tf
 
-            Also inspect the changed Terraform .tf files in this pull request.
+            Do not search the repository.
 
-            Review the actual Terraform plan, not just the source code.
+            Do not inspect GitHub separately.
 
-            Prepare a concise review titled exactly:
+            Do not run Terraform.
+
+            Do not run tfctl.
+
+            Do not modify files.
+
+            Prepare one concise review titled:
 
             ## Claude Terraform Plan Review
 
-            Cover:
+            Include:
 
             1. Plan Summary
+               Explain what the plan changes.
 
-               Explain what the HCP Terraform plan actually changes.
-
-            2. Risky or Destructive Changes
-
-               Call out resource deletions, replacements, downtime risk,
-               data-loss risk, or other potentially dangerous changes first.
+            2. Risk
+               State whether there are deletions, replacements,
+               downtime risks, or data-loss risks.
 
             3. Code-to-Plan Alignment
+               State whether the plan matches the Terraform
+               configuration in main.tf.
 
-               Determine whether the plan matches the apparent intent of
-               the Terraform code changes in this pull request.
-
-            4. Security and Terraform Best Practices
-
-               Look for:
-               - hardcoded secrets
-               - overly permissive access
-               - insecure configuration
-               - missing important tags
-               - drift-prone configuration
-               - other Terraform best-practice concerns
+            4. Security and Best Practices
+               Flag only meaningful Terraform or security issues.
 
             5. HCP Terraform Run Health
+               Mention warnings, failures, or policy issues.
 
-               Report warnings, policy failures, diagnostics, or errors
-               from run-status.md.
+            If the plan is low risk, say so briefly.
 
-            Reference specific Terraform resource addresses when possible.
-
-            If the plan is a no-op or clearly low risk, say so directly
-            and keep the review brief.
-
-            IMPORTANT:
-
-            You MUST post the completed review as a top-level comment
-            on PR #${{ github.event.pull_request.number }}.
-
-            Use gh pr comment for the final review.
-
-            Do not only return the review in your response.
-
-            Do not finish until the PR comment has been successfully posted.
-
-            Use this pattern:
+            Post the completed review exactly once as a top-level
+            pull request comment using:
 
             gh pr comment ${{ github.event.pull_request.number }} \
               --repo ${{ github.repository }} \
-              --body "<your completed review>"
+              --body "<review>"
 
-            Do not modify repository files.
-
-            Do not execute terraform apply.
-
-            Do not execute any mutating tfctl commands.
+            After the comment succeeds, stop.
 
           claude_args: |
-            --max-turns 15
-            --allowedTools "Read,Glob,Grep,Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh pr diff:*)"
+            --model claude-sonnet-5
+            --max-turns 8
+            --allowedTools "Read,Bash(gh pr comment:*)"
