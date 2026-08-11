@@ -55,4 +55,30 @@ jobs:
           esac
 
           tfctl_archive="tfctl_${TFCTL_VERSION}_linux_${tfctl_arch}.zip"
-          tfctl_release_url="https://releases.hashicorp.com/tf
+          tfctl_release_url="https://releases.hashicorp.com/tfctl/${TFCTL_VERSION}"
+
+          curl --fail --silent --show-error --location \
+            --output "${tfctl_archive}" \
+            "${tfctl_release_url}/${tfctl_archive}"
+
+          curl --fail --silent --show-error --location \
+            --output tfctl_SHA256SUMS \
+            "${tfctl_release_url}/tfctl_${TFCTL_VERSION}_SHA256SUMS"
+
+          grep " ${tfctl_archive}$" tfctl_SHA256SUMS | sha256sum --check -
+
+          unzip -q "${tfctl_archive}"
+          sudo install -m 0755 tfctl /usr/local/bin/tfctl
+
+          rm -f "${tfctl_archive}" tfctl_SHA256SUMS tfctl
+
+          tfctl --version
+
+      - name: Install tfctl skill for Claude
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tfctl harness install claude --global
+
+          echo "Installed tfctl skill
