@@ -70,14 +70,15 @@ jobs:
           rm -f "${tfctl_archive}" tfctl_SHA256SUMS tfctl
 
           tfctl --version
-      
+
       - name: Install tfctl skill for Claude
         shell: bash
         run: |
           set -euo pipefail
-        
+
           tfctl harness install claude --global
-        
+
+          echo "Installed tfctl Claude skill:"
           ls -l "$HOME/.claude/skills/tfctl/SKILL.md"
 
       - name: Upload Configuration
@@ -127,57 +128,148 @@ jobs:
           - Resource changes: ${ADD_COUNT} to add, ${CHANGE_COUNT} to change, ${DESTROY_COUNT} to destroy
           EOF
 
-          # Run status, including any Terraform diagnostics or policy failures.
-          tfctl run status "${RUN_ID}" --markdown --no-color \
+          # Collect HCP Terraform run status.
+          tfctl run status "${RUN_ID}" \
+            --markdown \
+            --no-color \
             > plan-artifacts/run-status.md
 
-          # Structured plan output. Large plans are reduced to the change set so
-          # the review prompt stays within a reasonable size.
-          if tfctl api "/plans/${PLAN_ID}/json-output" --no-color \
-            > plan-artifacts/plan.json 2> plan-artifacts/plan-json-error.txt; then
+          # Collect structured Terraform plan output.
+          #
+          # Large plans are reduced to the actual resource/output changes
+          # before they are passed to Claude.
+          if tfctl api "/plans/${PLAN_ID}/json-output" \
+            --no-color \
+            > plan-artifacts/plan.json \
+            2> plan-artifacts/plan-json-error.txt; then
+
             jq '{
               format_version,
               terraform_version,
               resource_changes: (.resource_changes // []),
               output_changes: (.output_changes // {})
-            }' plan-artifacts/plan.json > plan-artifacts/plan-changes.json
-            rm -f plan-artifacts/plan.json plan-artifacts/plan-json-error.txt
+            }' \
+              plan-artifacts/plan.json \
+              > plan-artifacts/plan-changes.json
+
+            rm -f \
+              plan-artifacts/plan.json \
+              plan-artifacts/plan-json-error.txt
           else
-            echo "Structured plan JSON unavailable; review will use the run status only." >&2
+            echo "Structured plan JSON unavailable; review will use run status only." >&2
+
             rm -f plan-artifacts/plan.json
           fi
 
+          echo "Plan artifacts:"
           ls -la plan-artifacts
 
       - name: Review Plan with Claude
         uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           track_progress: true
+
           prompt: |
-            You are reviewing a speculative Terraform plan for this pull request.
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
 
-            The plan artifacts are in the `plan-artifacts/` directory:
-            - `summary.md` — workspace, run link, and change counts
-            - `run-status.md` — HCP Terraform run status and any diagnostics
-            - `plan-changes.json` — structured resource and output changes (may be absent)
+            Use the installed tfctl skill when reviewing this
+            HCP Terraform plan.
 
-            Read those files and the changed `.tf` files in this repository, then
-            update your tracking comment with a review titled "Claude Terraform
-            Plan Review" that covers:
+            You are reviewing a speculative Terraform plan for this
+            pull request.
 
-            1. A plain-language summary of what this plan actually changes.
-            2. Destructive or risky changes — resource replacements, deletions, or
-               anything that would cause downtime or data loss. Call these out first.
-            3. Whether the plan matches the intent of the code changes in the diff,
-               and flag any change that looks unintended.
-            4. Security and best-practice concerns: hardcoded secrets, permissive
-               access rules, missing tags, drift-prone configuration.
-            5. Anything in `run-status.md` that failed or produced warnings.
+            The Terraform plan artifacts are located in:
 
-            Be concrete and reference specific resource addresses. If the plan is a
-            no-op or purely additive and low risk, say so briefly instead of padding
-            the review. Do not modify any files.
+            plan-artifacts/
+
+            Available files:
+
+            - summary.md
+              Contains the HCP Terraform organization, workspace,
+              run ID, plan ID, run link, and resource change counts.
+
+            - run-status.md
+              Contains the HCP Terraform run status, diagnostics,
+              policy failures, warnings, and other run information.
+
+            - plan-changes.json
+              Contains structured Terraform resource and output
+              changes. This file may be absent if structured plan
+              JSON was unavailable.
+
+            Read these files.
+
+            Also inspect the changed .tf files in this repository
+            so you can compare the Terraform code changes with the
+            actual HCP Terraform plan.
+
+            Prepare a review with this exact title:
+
+            ## Claude Terraform Plan Review
+
+            The review should cover:
+
+            1. Plan Summary
+
+               Explain in plain language what the Terraform plan
+               actually changes.
+
+            2. Risky or Destructive Changes
+
+               Call out these items first:
+
+               - resource deletions
+               - resource replacements
+               - changes that could cause downtime
+               - changes that could cause data loss
+
+               Reference specific Terraform resource addresses.
+
+            3. Code-to-Plan Alignment
+
+               Determine whether the Terraform plan matches the
+               apparent intent of the .tf changes in this pull
+               request.
+
+               Flag anything that appears unexpected or unintended.
+
+            4. Security and Terraform Best Practices
+
+               Look for issues including:
+
+               - hardcoded secrets
+               - overly permissive access
+               - insecure configuration
+               - missing important tags
+               - drift-prone configuration
+               - other Terraform best-practice concerns
+
+            5. HCP Terraform Run Health
+
+               Report anything in run-status.md that failed,
+               generated warnings, or requires attention.
+
+            If the plan is a no-op, purely additive, or obviously
+            low risk, say so clearly and keep the review concise.
+
+            Do not modify any files.
+
+            Do not execute Terraform apply.
+
+            Do not execute any mutating tfctl commands.
+
+            After completing the review, post the complete review
+            as a comment on PR #${{ github.event.pull_request.number }}
+            using:
+
+            gh pr comment ${{ github.event.pull_request.number }} --body "<review>"
+
           claude_args: |
             --max-turns 15
-            --allowedTools Read,Glob,Grep
+            --allowedTools "Read,Glob,Grep,Bash(gh pr comment:*)"
