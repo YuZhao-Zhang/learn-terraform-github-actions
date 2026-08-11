@@ -31,6 +31,7 @@ jobs:
       pull-requests: write
       issues: write
       actions: read
+      id-token: write
 
     steps:
       - name: Checkout
@@ -143,6 +144,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          track_progress: true
           prompt: |
             You are reviewing a speculative Terraform plan for this pull request.
 
@@ -152,7 +154,8 @@ jobs:
             - `plan-changes.json` — structured resource and output changes (may be absent)
 
             Read those files and the changed `.tf` files in this repository, then
-            post a single PR comment titled "Claude Terraform Plan Review" that covers:
+            update your tracking comment with a review titled "Claude Terraform
+            Plan Review" that covers:
 
             1. A plain-language summary of what this plan actually changes.
             2. Destructive or risky changes — resource replacements, deletions, or
